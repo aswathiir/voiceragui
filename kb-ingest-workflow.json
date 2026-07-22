@@ -1,0 +1,249 @@
+{
+  "name": "KB Ingest Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "kb-ingest",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [220, 300],
+      "webhookId": "kb-ingest"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { ok: true, fileId: $('Webhook Trigger').item.json.body?.fileId ?? $('Webhook Trigger').item.json.fileId } }}",
+        "options": {}
+      },
+      "id": "respond-accepted",
+      "name": "Respond Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [460, 140]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Extract inputs from the webhook trigger ──\nconst webhookData = $('Webhook Trigger').first().json;\nconst body = webhookData.body ?? webhookData;\nconst headers = webhookData.headers ?? {};\n\nconst fileId = body.fileId ?? `kb_${Date.now()}`;\nconst orgId = body.orgId ?? 'unknown_org';\nconst callbackUrl = body.callbackUrl ?? '';\nconst url = body.url ?? null;\nconst fileName = body.file?.originalFilename ?? body.fileName ?? (url ? new URL(url).hostname : 'unknown');\n\n// Check if there's a binary attachment from the webhook\nlet hasBinary = false;\ntry {\n  const binaryData = $('Webhook Trigger').first().binary;\n  hasBinary = binaryData && Object.keys(binaryData).length > 0;\n} catch (e) {\n  hasBinary = false;\n}\n\nreturn [{\n  json: {\n    fileId,\n    orgId,\n    callbackUrl,\n    url,\n    fileName,\n    hasBinary,\n    source: url ? 'url' : 'file'\n  }\n}];\n"
+      },
+      "id": "extract-inputs",
+      "name": "Extract Inputs",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.callbackUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ fileId: $json.fileId, stage: 'parsing', progress: 20 }) }}",
+        "options": {
+          "timeout": 5000,
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "id": "cb-parsing",
+      "name": "CB → Parsing",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [700, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Route: file or URL ──\nconst item = $input.first().json;\n\nlet extractedText = '';\n\nif (item.source === 'url' && item.url) {\n  // Fetch URL content\n  const resp = await fetch(item.url, {\n    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; KBIngest/1.0)' },\n    signal: AbortSignal.timeout(15000)\n  });\n  if (!resp.ok) throw new Error(`Failed to fetch URL: ${resp.status}`);\n  const html = await resp.text();\n  // Strip HTML tags for a rough text extraction\n  extractedText = html\n    .replace(/<script[^>]*>[\\s\\S]*?<\\/script>/gi, '')\n    .replace(/<style[^>]*>[\\s\\S]*?<\\/style>/gi, '')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ')\n    .replace(/&amp;/gi, '&')\n    .replace(/&lt;/gi, '<')\n    .replace(/&gt;/gi, '>')\n    .replace(/\\s{2,}/g, ' ')\n    .trim();\n} else {\n  // For file uploads — read the binary data attached by the webhook\n  try {\n    const binaryData = $('Webhook Trigger').first().binary;\n    if (binaryData) {\n      const key = Object.keys(binaryData)[0];\n      if (key) {\n        const buffer = await this.helpers.getBinaryDataBuffer(0, key);\n        const content = buffer.toString('utf-8');\n        \n        const fn = (item.fileName ?? '').toLowerCase();\n        if (fn.endsWith('.csv')) {\n          // CSV: each row becomes a line\n          extractedText = content;\n        } else if (fn.endsWith('.json')) {\n          // JSON: flatten to readable text\n          try {\n            const parsed = JSON.parse(content);\n            const flatten = (obj, prefix = '') => {\n              let lines = [];\n              for (const [k, v] of Object.entries(obj)) {\n                const key = prefix ? `${prefix}.${k}` : k;\n                if (v && typeof v === 'object' && !Array.isArray(v)) {\n                  lines.push(...flatten(v, key));\n                } else {\n                  lines.push(`${key}: ${JSON.stringify(v)}`);\n                }\n              }\n              return lines;\n            };\n            if (Array.isArray(parsed)) {\n              extractedText = parsed.map((row, i) => `Row ${i+1}: ${JSON.stringify(row)}`).join('\\n');\n            } else {\n              extractedText = flatten(parsed).join('\\n');\n            }\n          } catch {\n            extractedText = content;\n          }\n        } else if (fn.endsWith('.sql')) {\n          // SQL dump: extract INSERT statements and readable parts\n          const inserts = content.match(/INSERT\\s+INTO[^;]+;/gi) || [];\n          const creates = content.match(/CREATE\\s+TABLE[^;]+;/gi) || [];\n          extractedText = [...creates, ...inserts].join('\\n\\n') || content;\n        } else {\n          // PDF / DOCX / other: use raw text (n8n Extract node handles these better,\n          // but as a fallback we try raw UTF-8)\n          extractedText = content.replace(/[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]/g, ' ').trim();\n          if (extractedText.length < 50) {\n            extractedText = `[Binary file: ${item.fileName} — ${buffer.length} bytes. For PDF/DOCX, consider using n8n Extract from File node.]`;\n          }\n        }\n      }\n    }\n  } catch (e) {\n    extractedText = `Error reading file: ${e.message}`;\n  }\n}\n\nif (!extractedText || extractedText.length < 10) {\n  throw new Error(`No text could be extracted from ${item.source}: ${item.fileName ?? item.url}`);\n}\n\nreturn [{\n  json: {\n    ...item,\n    extractedText,\n    textLength: extractedText.length\n  }\n}];\n"
+      },
+      "id": "extract-text",
+      "name": "Extract Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [940, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.callbackUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ fileId: $json.fileId, stage: 'chunking', progress: 40 }) }}",
+        "options": {
+          "timeout": 5000,
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "id": "cb-chunking",
+      "name": "CB → Chunking",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Chunk text into ~500-token (~2000 char) segments with 200-char overlap ──\nconst item = $input.first().json;\nconst text = item.extractedText;\nconst CHUNK_SIZE = 2000;\nconst OVERLAP = 200;\n\nconst chunks = [];\nlet start = 0;\n\nwhile (start < text.length) {\n  let end = Math.min(start + CHUNK_SIZE, text.length);\n  \n  // Try to break at sentence boundary\n  if (end < text.length) {\n    const lastPeriod = text.lastIndexOf('. ', end);\n    const lastNewline = text.lastIndexOf('\\n', end);\n    const breakPoint = Math.max(lastPeriod, lastNewline);\n    if (breakPoint > start + CHUNK_SIZE * 0.5) {\n      end = breakPoint + 1;\n    }\n  }\n  \n  const chunk = text.slice(start, end).trim();\n  if (chunk.length > 20) {\n    chunks.push(chunk);\n  }\n  \n  start = end - OVERLAP;\n  if (start >= text.length) break;\n}\n\n// Return metadata + all chunks\nreturn [{\n  json: {\n    fileId: item.fileId,\n    orgId: item.orgId,\n    callbackUrl: item.callbackUrl,\n    fileName: item.fileName,\n    chunkCount: chunks.length,\n    chunks\n  }\n}];\n"
+      },
+      "id": "chunk-text",
+      "name": "Chunk Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1420, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.callbackUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ fileId: $json.fileId, stage: 'embedding', progress: 60, chunkCount: $json.chunkCount }) }}",
+        "options": {
+          "timeout": 5000,
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "id": "cb-embedding",
+      "name": "CB → Embedding",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1660, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Embed all chunks via Ollama nomic-embed-text ──\nconst item = $input.first().json;\nconst OLLAMA_URL = 'http://localhost:11434/api/embeddings';\nconst MODEL = 'nomic-embed-text';\nconst BATCH_SIZE = 10; // Process in batches to avoid overwhelming Ollama\n\nconst vectors = [];\n\nfor (let i = 0; i < item.chunks.length; i += BATCH_SIZE) {\n  const batch = item.chunks.slice(i, i + BATCH_SIZE);\n  \n  const batchResults = await Promise.all(\n    batch.map(async (chunkText, batchIdx) => {\n      const idx = i + batchIdx;\n      const resp = await fetch(OLLAMA_URL, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ model: MODEL, prompt: chunkText })\n      });\n      \n      if (!resp.ok) {\n        const errText = await resp.text();\n        throw new Error(`Ollama embedding failed for chunk ${idx}: ${resp.status} ${errText}`);\n      }\n      \n      const data = await resp.json();\n      return {\n        id: `${item.fileId}_chunk_${idx}`,\n        values: data.embedding,\n        metadata: {\n          orgId: item.orgId,\n          fileId: item.fileId,\n          fileName: item.fileName,\n          chunkIndex: idx,\n          text: chunkText.slice(0, 3600) // Pinecone metadata limit ~40KB\n        }\n      };\n    })\n  );\n  \n  vectors.push(...batchResults);\n}\n\nreturn [{\n  json: {\n    fileId: item.fileId,\n    orgId: item.orgId,\n    callbackUrl: item.callbackUrl,\n    fileName: item.fileName,\n    chunkCount: item.chunkCount,\n    vectorCount: vectors.length,\n    vectors\n  }\n}];\n"
+      },
+      "id": "embed-chunks",
+      "name": "Embed Chunks (Ollama)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1900, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Upsert vectors to Pinecone ──\nconst item = $input.first().json;\n\n// Pinecone config — uses the same creds as the voice-rag-query workflow\nconst PINECONE_API_KEY = 'pcsk_44U1wN_QGfdUdgsYtkgGHVu6UJ2K77GK3eDBgPL9aK7DfWNdgi3HS3AtviDmQenUyx5jZE';\nconst PINECONE_INDEX = 'vad';\n\n// Discover Pinecone host from the index description\nconst descResp = await fetch(`https://api.pinecone.io/indexes/${PINECONE_INDEX}`, {\n  headers: { 'Api-Key': PINECONE_API_KEY, 'Accept': 'application/json' }\n});\nif (!descResp.ok) {\n  throw new Error(`Pinecone describe index failed: ${descResp.status} ${await descResp.text()}`);\n}\nconst indexInfo = await descResp.json();\nconst host = indexInfo.host; // e.g. 'vad-xxxxx.svc.xxx.pinecone.io'\n\n// Batch upsert (Pinecone recommends max 100 vectors per request)\nconst BATCH = 100;\nlet upserted = 0;\n\nfor (let i = 0; i < item.vectors.length; i += BATCH) {\n  const batch = item.vectors.slice(i, i + BATCH);\n  \n  const upsertResp = await fetch(`https://${host}/vectors/upsert`, {\n    method: 'POST',\n    headers: {\n      'Api-Key': PINECONE_API_KEY,\n      'Content-Type': 'application/json'\n    },\n    body: JSON.stringify({ vectors: batch })\n  });\n  \n  if (!upsertResp.ok) {\n    const errBody = await upsertResp.text();\n    throw new Error(`Pinecone upsert failed at batch ${i}: ${upsertResp.status} ${errBody}`);\n  }\n  \n  const result = await upsertResp.json();\n  upserted += result.upsertedCount ?? batch.length;\n}\n\nreturn [{\n  json: {\n    fileId: item.fileId,\n    orgId: item.orgId,\n    callbackUrl: item.callbackUrl,\n    fileName: item.fileName,\n    chunkCount: item.chunkCount,\n    vectorCount: upserted\n  }\n}];\n"
+      },
+      "id": "upsert-pinecone",
+      "name": "Upsert to Pinecone",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2140, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.callbackUrl }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ fileId: $json.fileId, stage: 'indexed', progress: 100, chunkCount: $json.chunkCount, vectorCount: $json.vectorCount }) }}",
+        "options": {
+          "timeout": 5000,
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "id": "cb-indexed",
+      "name": "CB → Indexed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2380, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── Error handler: notify callback of failure ──\nconst allItems = $input.all();\nconst errorItem = allItems[0]?.json ?? {};\n\n// Try to find fileId and callbackUrl from the execution context\nlet fileId = errorItem.fileId;\nlet callbackUrl = errorItem.callbackUrl;\nlet errorMessage = 'Unknown pipeline error';\n\n// Try to extract from earlier nodes if not in error item\ntry {\n  const extracted = $('Extract Inputs').first().json;\n  fileId = fileId ?? extracted.fileId;\n  callbackUrl = callbackUrl ?? extracted.callbackUrl;\n} catch (e) {}\n\n// Get the actual error message\ntry {\n  const err = $input.first();\n  if (err.json?.message) errorMessage = err.json.message;\n  else if (err.json?.error) errorMessage = typeof err.json.error === 'string' ? err.json.error : JSON.stringify(err.json.error);\n  else if (err.error) errorMessage = err.error.message ?? String(err.error);\n} catch (e) {\n  errorMessage = e.message;\n}\n\nif (callbackUrl && fileId) {\n  await fetch(callbackUrl, {\n    method: 'POST',\n    headers: { 'Content-Type': 'application/json' },\n    body: JSON.stringify({\n      fileId,\n      stage: 'failed',\n      progress: 0,\n      errorMessage: errorMessage.slice(0, 500)\n    })\n  });\n}\n\nreturn [{ json: { fileId, stage: 'failed', errorMessage } }];\n"
+      },
+      "id": "error-handler",
+      "name": "Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1420, 560],
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          { "node": "Respond Accepted", "type": "main", "index": 0 },
+          { "node": "Extract Inputs", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Extract Inputs": {
+      "main": [
+        [
+          { "node": "CB → Parsing", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "CB → Parsing": {
+      "main": [
+        [
+          { "node": "Extract Text", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Extract Text": {
+      "main": [
+        [
+          { "node": "CB → Chunking", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "CB → Chunking": {
+      "main": [
+        [
+          { "node": "Chunk Text", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Chunk Text": {
+      "main": [
+        [
+          { "node": "CB → Embedding", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "CB → Embedding": {
+      "main": [
+        [
+          { "node": "Embed Chunks (Ollama)", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Embed Chunks (Ollama)": {
+      "main": [
+        [
+          { "node": "Upsert to Pinecone", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Upsert to Pinecone": {
+      "main": [
+        [
+          { "node": "CB → Indexed", "type": "main", "index": 0 }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": ""
+  },
+  "staticData": null,
+  "tags": [
+    { "name": "kb-ingest" },
+    { "name": "voice-rag" }
+  ],
+  "triggerCount": 1,
+  "pinData": {}
+}

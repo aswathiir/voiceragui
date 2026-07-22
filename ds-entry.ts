@@ -1,0 +1,12 @@
+// Synthetic entry for design-sync converter — re-exports all design system components
+export { Button, buttonVariants } from './components/ui/button'
+export { Badge, Input, Textarea } from './components/ui/primitives'
+export { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter, DialogTrigger, DialogClose } from './components/ui/dialog'
+export { InteractiveMenu } from './components/ui/modern-mobile-menu'
+export { default as MotionButton } from './components/ui/motion-button'
+export { VoicePoweredOrb } from './components/ui/voice-orb'
+export { WaveBackground, FloatingLogCards } from './components/ui/ambient'
+export { OnboardingDialog } from './components/ui/onboarding'
+export { Docks } from './components/ui/docks'
+export { Sidebar } from './components/ui/sidebar'
+export { ThemeProvider } from './lib/theme'

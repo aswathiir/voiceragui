@@ -1,0 +1,40 @@
+# ── Dependencies ────────────────────────────────────────────────────────────
+node_modules/
+indicenv/
+
+# ── Next.js build output ─────────────────────────────────────────────────────
+.next/
+out/
+
+# ── Build / dist artifacts ───────────────────────────────────────────────────
+dist/
+ds-bundle/
+
+# ── TypeScript build info ────────────────────────────────────────────────────
+*.tsbuildinfo
+
+# ── Environment variables (NEVER commit secrets) ────────────────────────────
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+
+# ── Runtime / local data ─────────────────────────────────────────────────────
+.data/
+
+# ── IDE / editor specific ─────────────────────────────────────────────────────
+.claude/
+.design-sync/
+.ds-sync/
+
+# ── OS files ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
+
+# ── Misc ─────────────────────────────────────────────────────────────────────
+*.pem

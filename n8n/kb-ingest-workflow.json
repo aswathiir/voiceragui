@@ -1,0 +1,397 @@
+[
+  {
+    "updatedAt": "2026-07-05T03:20:01.177Z",
+    "createdAt": "2026-07-05T03:20:01.177Z",
+    "id": "bAdIa6BZdV5dwUJA",
+    "name": "KB Ingest (BeyondForms)",
+    "description": null,
+    "active": true,
+    "isArchived": false,
+    "nodes": [
+      {
+        "parameters": {
+          "httpMethod": "POST",
+          "path": "kb-ingest",
+          "responseMode": "onReceived",
+          "options": {}
+        },
+        "id": "wh-kb-ingest",
+        "name": "Webhook",
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2.1,
+        "position": [
+          -560,
+          40
+        ],
+        "webhookId": "kb-ingest"
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "={{ $('Webhook').first().json.body.callbackUrl }}",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ fileId: $('Webhook').first().json.body.fileId, orgId: $('Webhook').first().json.body.orgId, stage: 'parsing', progress: 25 }) }}",
+          "options": {}
+        },
+        "id": "cb-parsing",
+        "name": "Callback parsing",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.3,
+        "position": [
+          -300,
+          -180
+        ],
+        "onError": "continueRegularOutput"
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "={{ $('Webhook').first().json.body.callbackUrl }}",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ fileId: $('Webhook').first().json.body.fileId, orgId: $('Webhook').first().json.body.orgId, stage: 'chunking', progress: 50 }) }}",
+          "options": {}
+        },
+        "id": "cb-chunking",
+        "name": "Callback chunking",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.3,
+        "position": [
+          -60,
+          -180
+        ],
+        "onError": "continueRegularOutput"
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "={{ $('Webhook').first().json.body.callbackUrl }}",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ fileId: $('Webhook').first().json.body.fileId, orgId: $('Webhook').first().json.body.orgId, stage: 'embedding', progress: 75 }) }}",
+          "options": {}
+        },
+        "id": "cb-embedding",
+        "name": "Callback embedding",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.3,
+        "position": [
+          180,
+          -180
+        ],
+        "onError": "continueRegularOutput"
+      },
+      {
+        "parameters": {
+          "jsCode": "// Normalize ANY uploaded source into a binary the document loader accepts.\n//  - Database exports of every flavour (.sql from MySQL/Postgres/SQLite/MSSQL,\n//    .csv, .tsv, .json, .ndjson, .xml, .yaml, .log ...) are text \u2014 force\n//    mimeType text/plain so the auto loader always parses them.\n//  - PDF/DOCX keep their real mime types (dedicated loaders handle them).\n//  - The binary key is standardized to `file` regardless of what the form\n//    field or n8n version named it.\n//  - URL-only ingests (body.url, no file) are fetched here and passed on\n//    as a text binary.\nconst item = $input.first();\nconst body = item.json.body ?? {};\nconst TEXT_EXTS = ['sql','csv','tsv','json','ndjson','txt','md','markdown','xml','yml','yaml','log','ini','conf','tql','cql','dump'];\n\nconst binKeys = Object.keys(item.binary ?? {});\n\nif (binKeys.length > 0) {\n  const bin = item.binary[binKeys[0]];\n  const name = String(bin.fileName ?? '').toLowerCase();\n  const ext = name.includes('.') ? name.split('.').pop() : '';\n  if (TEXT_EXTS.includes(ext) || !bin.mimeType || bin.mimeType === 'application/octet-stream') {\n    // Unknown/octet-stream mimes are overwhelmingly text exports \u2014 treat as text\n    // unless clearly a binary doc format.\n    if (!['pdf','docx','doc','xlsx','xls'].includes(ext)) {\n      bin.mimeType = 'text/plain';\n    }\n  }\n  // JSON database exports embed and retrieve far better as readable\n  // key: value lines than as raw escaped JSON, so flatten them here.\n  if (['json','ndjson'].includes(ext)) {\n    try {\n      const buf = await this.helpers.getBinaryDataBuffer(0, binKeys[0]);\n      const parsed = JSON.parse(buf.toString('utf-8'));\n      const rows = Array.isArray(parsed) ? parsed : [parsed];\n      const lines = rows.map((r, i) =>\n        typeof r === 'object' && r !== null\n          ? `Record ${i + 1}: ` + Object.entries(r).map(([k, v]) => `${k}: ${JSON.stringify(v)}`).join(', ')\n          : String(r)\n      ).join('\\n');\n      const flat = await this.helpers.prepareBinaryData(Buffer.from(lines, 'utf-8'), bin.fileName ?? 'data.txt', 'text/plain');\n      return [{ json: item.json, binary: { file: flat } }];\n    } catch (e) { /* fall through to raw text if parsing fails */ }\n  }\n  return [{ json: item.json, binary: { file: bin } }];\n}\n\nif (body.url) {\n  const res = await this.helpers.httpRequest({\n    url: String(body.url),\n    method: 'GET',\n    returnFullResponse: false,\n    encoding: 'text',\n    timeout: 20000,\n  });\n  const text = typeof res === 'string' ? res : JSON.stringify(res);\n  // Strip HTML tags so pages index as readable text\n  const cleaned = text.replace(/<script[\\s\\S]*?<\\/script>/gi, ' ').replace(/<style[\\s\\S]*?<\\/style>/gi, ' ').replace(/<[^>]+>/g, ' ').replace(/\\s{2,}/g, ' ').trim();\n  const buffer = Buffer.from(cleaned, 'utf-8');\n  const bin = await this.helpers.prepareBinaryData(buffer, 'page.txt', 'text/plain');\n  return [{ json: item.json, binary: { file: bin } }];\n}\n\nthrow new Error('No file or url in ingest payload');"
+        },
+        "id": "normalize-file",
+        "name": "Normalize Source",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          -320,
+          120
+        ],
+        "onError": "continueErrorOutput"
+      },
+      {
+        "parameters": {
+          "mode": "insert",
+          "pineconeIndex": {
+            "__rl": true,
+            "value": "vad",
+            "mode": "list",
+            "cachedResultName": "vad"
+          },
+          "options": {
+            "pineconeNamespace": "={{ $('Webhook').first().json.body.orgId }}"
+          }
+        },
+        "id": "pinecone-insert",
+        "name": "Pinecone Insert",
+        "type": "@n8n/n8n-nodes-langchain.vectorStorePinecone",
+        "typeVersion": 1.3,
+        "position": [
+          -40,
+          120
+        ],
+        "onError": "continueErrorOutput",
+        "credentials": {
+          "pineconeApi": {
+            "id": "O6H56aGQyE10Uqog",
+            "name": "PineconeApi account"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "dataType": "binary",
+          "binaryMode": "specificField",
+          "binaryDataKey": "file",
+          "loader": "auto",
+          "options": {
+            "metadata": {
+              "metadataValues": [
+                {
+                  "name": "orgId",
+                  "value": "={{ $('Webhook').first().json.body.orgId }}"
+                },
+                {
+                  "name": "fileId",
+                  "value": "={{ $('Webhook').first().json.body.fileId }}"
+                },
+                {
+                  "name": "fileName",
+                  "value": "={{ Object.values($('Webhook').first().binary ?? {})[0]?.fileName ?? ($('Webhook').first().json.body.url ?? 'unknown') }}"
+                }
+              ]
+            }
+          }
+        },
+        "id": "doc-loader",
+        "name": "Document Loader",
+        "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+        "typeVersion": 1.1,
+        "position": [
+          60,
+          340
+        ]
+      },
+      {
+        "parameters": {
+          "chunkSize": 2000,
+          "chunkOverlap": 200,
+          "options": {}
+        },
+        "id": "text-splitter",
+        "name": "Text Splitter",
+        "type": "@n8n/n8n-nodes-langchain.textSplitterRecursiveCharacterTextSplitter",
+        "typeVersion": 1,
+        "position": [
+          180,
+          500
+        ]
+      },
+      {
+        "parameters": {
+          "model": "nomic-embed-text:latest"
+        },
+        "id": "ollama-embeddings",
+        "name": "Ollama Embeddings",
+        "type": "@n8n/n8n-nodes-langchain.embeddingsOllama",
+        "typeVersion": 1,
+        "position": [
+          -160,
+          340
+        ],
+        "credentials": {
+          "ollamaApi": {
+            "id": "brLXyU4S8qdGYkEW",
+            "name": "Ollama account"
+          }
+        }
+      },
+      {
+        "parameters": {
+          "jsCode": "return [{ json: { chunkCount: $input.all().length } }];"
+        },
+        "id": "count-chunks",
+        "name": "Count Chunks",
+        "type": "n8n-nodes-base.code",
+        "typeVersion": 2,
+        "position": [
+          220,
+          120
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "={{ $('Webhook').first().json.body.callbackUrl }}",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ fileId: $('Webhook').first().json.body.fileId, orgId: $('Webhook').first().json.body.orgId, stage: 'indexed', progress: 100, chunkCount: $json.chunkCount, vectorCount: $json.chunkCount }) }}",
+          "options": {}
+        },
+        "id": "cb-indexed",
+        "name": "Callback indexed",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.3,
+        "position": [
+          460,
+          120
+        ]
+      },
+      {
+        "parameters": {
+          "method": "POST",
+          "url": "={{ $('Webhook').first().json.body.callbackUrl }}",
+          "sendBody": true,
+          "specifyBody": "json",
+          "jsonBody": "={{ JSON.stringify({ fileId: $('Webhook').first().json.body.fileId, orgId: $('Webhook').first().json.body.orgId, stage: 'failed', progress: 0, errorMessage: ($json.error && $json.error.message) ? String($json.error.message).slice(0, 300) : 'Ingestion failed in n8n' }) }}",
+          "options": {}
+        },
+        "id": "cb-failed",
+        "name": "Callback failed",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4.3,
+        "position": [
+          220,
+          320
+        ]
+      }
+    ],
+    "connections": {
+      "Webhook": {
+        "main": [
+          [
+            {
+              "node": "Callback parsing",
+              "type": "main",
+              "index": 0
+            },
+            {
+              "node": "Normalize Source",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Callback parsing": {
+        "main": [
+          [
+            {
+              "node": "Callback chunking",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Callback chunking": {
+        "main": [
+          [
+            {
+              "node": "Callback embedding",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Normalize Source": {
+        "main": [
+          [
+            {
+              "node": "Pinecone Insert",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Callback failed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Pinecone Insert": {
+        "main": [
+          [
+            {
+              "node": "Count Chunks",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Callback failed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Count Chunks": {
+        "main": [
+          [
+            {
+              "node": "Callback indexed",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Document Loader": {
+        "ai_document": [
+          [
+            {
+              "node": "Pinecone Insert",
+              "type": "ai_document",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Text Splitter": {
+        "ai_textSplitter": [
+          [
+            {
+              "node": "Document Loader",
+              "type": "ai_textSplitter",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Ollama Embeddings": {
+        "ai_embedding": [
+          [
+            {
+              "node": "Pinecone Insert",
+              "type": "ai_embedding",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "settings": {
+      "executionOrder": "v1"
+    },
+    "staticData": null,
+    "meta": null,
+    "pinData": {},
+    "versionId": "55aeb66f-7802-48d6-8448-cec810636a1a",
+    "activeVersionId": "55aeb66f-7802-48d6-8448-cec810636a1a",
+    "versionCounter": 9,
+    "triggerCount": 1,
+    "tags": [],
+    "shared": [
+      {
+        "updatedAt": "2026-07-05T03:20:01.179Z",
+        "createdAt": "2026-07-05T03:20:01.179Z",
+        "role": "workflow:owner",
+        "workflowId": "bAdIa6BZdV5dwUJA",
+        "projectId": "X01osrGHH8zBlqPk",
+        "project": {
+          "updatedAt": "2026-04-25T06:37:22.706Z",
+          "createdAt": "2026-04-25T06:34:44.620Z",
+          "id": "X01osrGHH8zBlqPk",
+          "name": "Aswathi Ranjith <aswathiranjikk@gmail.com>",
+          "type": "personal",
+          "icon": null,
+          "description": null,
+          "creatorId": "1055457d-ee9e-41da-818d-d387a55af466"
+        }
+      }
+    ]
+  }
+]
